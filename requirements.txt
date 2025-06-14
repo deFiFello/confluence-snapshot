@@ -3,3 +3,4 @@ ccxt
 pandas
 pandas_ta
 numpy<2.0          # keeps pandas-ta happy
+gunicorn==22.0.0
