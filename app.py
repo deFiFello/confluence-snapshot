@@ -1,78 +1,72 @@
 """
-app.py – Confluence Snapshot micro-service
-──────────────────────────────────────────
-Pulls the latest OHLCV from Binance, calculates RSI & ATR with
-pandas-ta, and returns a compact JSON snapshot suitable for a GPT
-“action” (OpenAPI) endpoint.
-
-Local dev:
-    python3 -m venv .venv && source .venv/bin/activate
-    pip install -r requirements.txt
-    python app.py
-
-Render deployment:
-    Start command →  gunicorn app:app
+app.py – Confluence Snapshot micro-service  (v4)
+Adds exchange-switching to dodge the Binance 451 ban.
+────────────────────────────────────────────────────────────────
 """
 
 import os
 import math
 from flask import Flask, request, jsonify, abort
-
 import ccxt
 import pandas as pd
 import pandas_ta as ta
 
 
 # ───────────────────────────────────────────────────────────────
-#  Exchange init (public endpoints only)
+# Helpers
 # ───────────────────────────────────────────────────────────────
-ex = ccxt.binance({"enableRateLimit": True})
+def get_exchange(exchange_id: str = "binanceus") -> ccxt.Exchange:
+    """
+    Build a ccxt exchange instance.
 
+    Defaults to 'binanceus' so it works from U-S IPs.
+    Any ccxt-supported id (kucoin, bybit, okx, …) is accepted.
+    """
+    if not hasattr(ccxt, exchange_id):
+        abort(400, description=f"Unsupported exchange '{exchange_id}'")
+    return getattr(ccxt, exchange_id)({
+        "enableRateLimit": True,
+    })
+
+
+def finite_or_none(x: float | None):
+    return None if (x is None or (isinstance(x, float) and not math.isfinite(x))) else x
+
+
+# ───────────────────────────────────────────────────────────────
+# Flask
+# ───────────────────────────────────────────────────────────────
 app = Flask(__name__)
+DEFAULT_LOOKBACK  = int(os.getenv("LOOKBACK", 14))
+DEFAULT_EXCHANGE  = os.getenv("EXCHANGE", "binanceus")   # dodge 451 by default
+DEFAULT_INTERVAL  = os.getenv("INTERVAL", "1h")
+DEFAULT_PAIR      = os.getenv("PAIR", "BTC/USDT")
 
 
 @app.route("/")
 def index():
-    """Simple health-check route."""
-    return "Confluence Snapshot is up and running!", 200
+    return "Confluence Snapshot is live 🚀", 200
 
 
 @app.route("/snapshot", methods=["GET", "POST", "OPTIONS"])
 def snapshot():
-    """
-    Accepts EITHER a GET query string or a POST JSON body.
-
-    • GET  /snapshot?pair=BTCUSDT&interval=1h[&lookback=14]
-    • POST /snapshot   {"pair": "BTCUSDT", "interval": "1h", "lookback": 14}
-
-    Returns:
-        {
-          "price": 66540.12,
-          "rsi": 58.23,
-          "atr": 643.77,
-          "swingHigh": 67021.0,
-          "swingLow": 65432.0,
-          "bos": 67021.0,
-          "orderBlock": "66086-67340"
-        }
-    """
-    # CORS pre-flight
-    if request.method == "OPTIONS":
+    if request.method == "OPTIONS":          # CORS pre-flight
         return "", 204
 
-    # ── Parse input ────────────────────────────────────────────
     if request.method == "GET":
-        pair     = request.args.get("pair")
-        tf       = request.args.get("interval") or request.args.get("timeframe")
-        lookback = int(request.args.get("lookback", 14))
-    else:  # POST
-        data     = request.get_json(force=True, silent=True) or {}
-        pair     = data.get("pair")
-        tf       = data.get("interval") or data.get("timeframe")
-        lookback = int(data.get("lookback", 14))
+        params   = request.args
+    else:                                    # POST
+        params   = request.get_json(force=True, silent=True) or {}
+
+    pair      = params.get("pair",      DEFAULT_PAIR)
+    tf        = params.get("interval") or params.get("timeframe") or DEFAULT_INTERVAL
+    lookback  = int(params.get("lookback",  DEFAULT_LOOKBACK))
+    exch_id   = params.get("exchange",  DEFAULT_EXCHANGE).lower()
 
     if not pair or not tf:
         abort(400, description="`pair` and `interval` are required")
+
+    ex = get_exchange(exch_id)
 
     # ── Fetch candles ──────────────────────────────────────────
     try:
@@ -89,32 +83,29 @@ def snapshot():
     swing_high = df["h"].max()
     swing_low  = df["l"].min()
 
-    # Placeholder smart-money fields
-    bos = swing_high                                  # basic “break of structure”
+    bos = swing_high                                     # placeholder “break of structure”
     ob_low, ob_high = round(swing_low * 1.01, 2), round(swing_low * 1.03, 2)
 
-    raw = dict(
-        price      = round(float(df["c"].iloc[-1]), 2),
-        rsi        = round(float(rsi_val), 2),
-        atr        = round(float(atr_val), 2),
-        swingHigh  = round(float(swing_high), 2),
-        swingLow   = round(float(swing_low), 2),
-        bos        = round(float(bos), 2),
-        orderBlock = f"{ob_low}-{ob_high}",
-    )
-
-    # ── Clean NaN / Inf so JSON is always valid ───────────────
-    clean = {
-        k: (None
-            if v is None or (isinstance(v, float) and not math.isfinite(v))
-            else v)
-        for k, v in raw.items()
+    payload = {
+        "exchange":   exch_id,
+        "pair":       pair,
+        "interval":   tf,
+        "price":      round(float(df['c'].iloc[-1]), 2),
+        "rsi":        round(float(rsi_val), 2),
+        "atr":        round(float(atr_val), 2),
+        "swingHigh":  round(float(swing_high), 2),
+        "swingLow":   round(float(swing_low), 2),
+        "bos":        round(float(bos), 2),
+        "orderBlock": f"{ob_low}-{ob_high}",
     }
 
-    return jsonify(clean)
+    # clean NaN / Inf
+    payload = {k: finite_or_none(v) for k, v in payload.items()}
+
+    return jsonify(payload)
 
 
-# ── Entrypoint for local dev ───────────────────────────────────
+# ── Local dev entrypoint ───────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))  # Render injects PORT
+    port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=True)
