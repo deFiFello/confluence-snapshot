@@ -25,6 +25,10 @@ ex = ccxt.binance({"enableRateLimit": True})
 
 app = Flask(__name__)
 
+@app.route("/")
+def index():
+    return "Confluence Snapshot is up and running!", 200
+
 
 @app.route("/snapshot", methods=["POST"])
 def snapshot() -> jsonify:
